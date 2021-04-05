@@ -1,6 +1,7 @@
 from conans import ConanFile, CMake, tools
 from conans.errors import ConanInvalidConfiguration
 import os
+import textwrap
 
 
 class ProtobufConan(ConanFile):
@@ -17,12 +18,14 @@ class ProtobufConan(ConanFile):
         "shared": [True, False],
         "fPIC": [True, False],
         "with_zlib": [True, False],
+        "with_rtti": [True, False],
         "lite": [True, False],
     }
     default_options = {
         "shared": False,
         "fPIC": True,
         "with_zlib": True,
+        "with_rtti": True,
         "lite": False,
     }
 
@@ -44,9 +47,15 @@ class ProtobufConan(ConanFile):
     def _is_clang_x86(self):
         return self.settings.compiler == "clang" and self.settings.arch == "x86"
 
+    @property
+    def _can_disable_rtti(self):
+        return tools.Version(self.version) >= "3.15.4"
+
     def config_options(self):
         if self.settings.os == "Windows":
             del self.options.fPIC
+        if not self._can_disable_rtti:
+            del self.options.with_rtti
 
     def configure(self):
         if self.options.shared:
@@ -59,6 +68,10 @@ class ProtobufConan(ConanFile):
             if tools.Version(self.settings.compiler.version) < "14":
                 raise ConanInvalidConfiguration("On Windows Protobuf can only be built with "
                                                 "Visual Studio 2015 or higher.")
+
+        if self.settings.compiler == "clang":
+           if tools.Version(self.version) >= "3.15.4" and tools.Version(self.settings.compiler.version) < "4":
+                raise ConanInvalidConfiguration("protobuf {} doesn't support clang < 4".format(self.version))
 
     def requirements(self):
         if self.options.with_zlib:
@@ -82,8 +95,8 @@ class ProtobufConan(ConanFile):
             self._cmake.definitions["protobuf_BUILD_PROTOC_BINARIES"] = True
             if tools.Version(self.version) >= "3.14.0":
                 self._cmake.definitions["protobuf_BUILD_LIBPROTOC"] = True
-            if tools.Version(self.version) >= "3.15.4":
-                self._cmake.definitions["protobuf_DISABLE_RTTI"] = True # TODO: create an option for 3.15.4+?
+            if self._can_disable_rtti:
+                self._cmake.definitions["protobuf_DISABLE_RTTI"] = not self.options.with_rtti
             if self.settings.compiler.get_safe("runtime"):
                 self._cmake.definitions["protobuf_MSVC_STATIC_RUNTIME"] = str(self.settings.compiler.runtime) in ["MT", "MTd", "static"]
             self._cmake.configure(build_folder=self._build_subfolder)
@@ -108,16 +121,22 @@ class ProtobufConan(ConanFile):
         protoc_filename = "protoc" + exe_ext
         module_folder_depth = len(os.path.normpath(self._cmake_install_base_path).split(os.path.sep))
         protoc_rel_path = "{}bin/{}".format("".join(["../"] * module_folder_depth), protoc_filename)
+        protoc_target = textwrap.dedent("""\
+            if(NOT TARGET protobuf::protoc)
+                find_program(PROTOC_PROGRAM protoc PATHS ENV PATH NO_DEFAULT_PATH)
+                if(NOT PROTOC_PROGRAM)
+                    set(PROTOC_PROGRAM \"${{CMAKE_CURRENT_LIST_DIR}}/{protoc_rel_path}\")
+                endif()
+                get_filename_component(PROTOC_PROGRAM \"${{PROTOC_PROGRAM}}\" ABSOLUTE)
+                set(Protobuf_PROTOC_EXECUTABLE ${{PROTOC_PROGRAM}} CACHE FILEPATH \"The protoc compiler\")
+                add_executable(protobuf::protoc IMPORTED)
+                set_property(TARGET protobuf::protoc PROPERTY IMPORTED_LOCATION ${{Protobuf_PROTOC_EXECUTABLE}})
+            endif()
+        """.format(protoc_rel_path=protoc_rel_path))
         tools.replace_in_file(
             protobuf_config_cmake,
             "include(\"${CMAKE_CURRENT_LIST_DIR}/protobuf-targets.cmake\")",
-            ("get_filename_component(PROTOC_FULL_PATH \"${{CMAKE_CURRENT_LIST_DIR}}/{protoc_rel_path}\" ABSOLUTE)\n"
-             "set(Protobuf_PROTOC_EXECUTABLE ${{PROTOC_FULL_PATH}} CACHE FILEPATH \"The protoc compiler\")\n"
-             "if(NOT TARGET protobuf::protoc)\n"
-             "    add_executable(protobuf::protoc IMPORTED)\n"
-             "    set_property(TARGET protobuf::protoc PROPERTY IMPORTED_LOCATION ${{Protobuf_PROTOC_EXECUTABLE}})\n"
-             "endif()"
-            ).format(protoc_rel_path=protoc_rel_path)
+            protoc_target
         )
 
         # Set DYLD_LIBRARY_PATH in command line to avoid issues with shared protobuf
@@ -134,7 +153,7 @@ class ProtobufConan(ConanFile):
             tools.replace_in_file(
                 protobuf_config_cmake,
                 "COMMAND  protobuf::protoc",
-                "COMMAND ${CMAKE_COMMAND} -E env \"DYLD_LIBRARY_PATH=${CUSTOM_DYLD_LIBRARY_PATH}\" ${Protobuf_PROTOC_EXECUTABLE}"
+                "COMMAND ${CMAKE_COMMAND} -E env \"DYLD_LIBRARY_PATH=${CUSTOM_DYLD_LIBRARY_PATH}\" $<TARGET_FILE:protobuf::protoc>"
             )
 
         # Disable a potential warning in protobuf-module.cmake.in
@@ -193,6 +212,8 @@ class ProtobufConan(ConanFile):
             self.cpp_info.components["libprotobuf"].system_libs.append("pthread")
             if self._is_clang_x86 or "arm" in str(self.settings.arch):
                 self.cpp_info.components["libprotobuf"].system_libs.append("atomic")
+        if self.settings.os == "Android":
+            self.cpp_info.components["libprotobuf"].system_libs.append("log")
         if self.settings.os == "Windows":
             if self.options.shared:
                 self.cpp_info.components["libprotobuf"].defines = ["PROTOBUF_USE_DLLS"]
@@ -223,6 +244,8 @@ class ProtobufConan(ConanFile):
             if self.settings.os == "Windows":
                 if self.options.shared:
                     self.cpp_info.components["libprotobuf-lite"].defines = ["PROTOBUF_USE_DLLS"]
+            if self.settings.os == "Android":
+                self.cpp_info.components["libprotobuf-lite"].system_libs.append("log")
 
             self.cpp_info.components["libprotobuf-lite"].builddirs.append(self._cmake_install_base_path)
             self.cpp_info.components["libprotobuf-lite"].build_modules = [
