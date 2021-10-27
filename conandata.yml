@@ -5,3 +5,7 @@ sources:
   "3.17.1":
     url: "https://github.com/protocolbuffers/protobuf/archive/v3.17.1.tar.gz"
     sha256: "036d66d6eec216160dd898cfb162e9d82c1904627642667cc32b104d407bb411"
+patches:
+  "3.19.0":
+    - patch_file: "patches/upstream-pr-9153-msvc-runtime.patch"
+      base_path: "source_subfolder"
